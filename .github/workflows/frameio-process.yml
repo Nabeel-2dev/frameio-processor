@@ -5,14 +5,14 @@ on:
     types: [process-folder]
 
 env:
-  AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
-  AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+  AIRTABLE_TOKEN: "patqQjUnvTPGwQXms.97e2e59d9d5726b17d0fd43bc59c5077cff8be7e7b1b7b3ec82b2beff0f17fbe"
+  AIRTABLE_BASE_ID: "appWU7ZO2ijKsBGf1"
   TABLE_NAME: "Result%20Folders"
 
 jobs:
   process-folder:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 30
     
     steps:
     - name: Extract Parameters
@@ -27,15 +27,18 @@ jobs:
         echo "  Record: ${{ github.event.client_payload.recordId }}"
         echo "  Script: ${{ github.event.client_payload.scriptUrl }}"
 
-    - name: Create Helper Scripts
+    - name: Process Frame.io Upload
       run: |
-        # Create call_script function as a separate file
-        cat > /tmp/call_script.sh << 'SCRIPT_EOF'
-        #!/bin/bash
+        echo "🚀 Starting Frame.io processing..."
+        echo "Folder URL: ${{ steps.params.outputs.folder_url }}"
+        echo "Record ID: ${{ steps.params.outputs.record_id }}"
+        echo "Script URL: ${{ steps.params.outputs.script_url }}"
+        
+        # Function to call Google Apps Script with retry logic
         call_script() {
           local action=$1
           local params=$2
-          local max_attempts=5
+          local max_attempts=3
           local attempt=1
           
           while [ $attempt -le $max_attempts ]; do
@@ -43,66 +46,37 @@ jobs:
             
             local response=$(curl -s -L \
               --max-time 300 \
-              --retry 3 \
-              --retry-delay 2 \
-              "$SCRIPT_URL?action=$action$params" 2>/dev/null)
+              --retry 2 \
+              --retry-delay 5 \
+              "$script_url?action=$action$params")
             
             if [ $? -eq 0 ] && [ -n "$response" ]; then
-              if echo "$response" | grep -q '"ok":true'; then
-                echo "$response"
-                return 0
-              elif echo "$response" | grep -q '"ok":false'; then
-                local error=$(echo "$response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')
-                
-                if [[ "$error" == *"quota"* ]] || [[ "$error" == *"bandwidth"* ]] || [[ "$error" == *"timeout"* ]]; then
-                  echo "⚠️  Retryable error: $error (attempt $attempt)"
-                  sleep $((attempt * 3))
-                  attempt=$((attempt + 1))
-                  continue
-                else
-                  echo "❌ Non-retryable error: $error"
-                  echo "$response"
-                  return 1
-                fi
-              fi
+              echo "$response"
+              return 0
             fi
             
-            echo "🔄 Request failed, retrying in $((attempt * 2))s..."
-            sleep $((attempt * 2))
+            echo "🔄 Retrying in 5 seconds..."
+            sleep 5
             attempt=$((attempt + 1))
           done
           
           echo "❌ Failed after $max_attempts attempts"
           return 1
         }
-        SCRIPT_EOF
         
-        chmod +x /tmp/call_script.sh
+        local script_url="${{ steps.params.outputs.script_url }}"
+        local record_id="${{ steps.params.outputs.record_id }}"
         
-        # Set environment variables
-        echo "SCRIPT_URL=${{ steps.params.outputs.script_url }}" >> $GITHUB_ENV
-        echo "RECORD_ID=${{ steps.params.outputs.record_id }}" >> $GITHUB_ENV
-        echo "FOLDER_URL=${{ steps.params.outputs.folder_url }}" >> $GITHUB_ENV
-
-    - name: Initialize Folder Processing
-      id: init
-      run: |
-        echo "🚀 Starting Frame.io processing..."
-        echo "Folder URL: $FOLDER_URL"
-        echo "Record ID: $RECORD_ID"
-        echo "Script URL: $SCRIPT_URL"
-        
-        source /tmp/call_script.sh
-        
+        # Step 1: Initialize folder
         echo "📁 Step 1: Initializing folder..."
-        init_response=$(call_script "initFolder" "&folderUrl=$FOLDER_URL")
+        init_response=$(call_script "initFolder" "&folderUrl=${{ steps.params.outputs.folder_url }}")
         
-        if [ $? -ne 0 ]; then
+        if echo "$init_response" | grep -q '"ok":false'; then
           echo "❌ Init error: $(echo "$init_response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')"
           exit 1
         fi
         
-        echo "✅ Initialization successful!"
+        echo "✅ Files found for processing"
         echo "$init_response"
         
         # Extract group ID
@@ -110,168 +84,36 @@ jobs:
         
         if [ -z "$group_id" ] || [ "$group_id" = "null" ]; then
           echo "ℹ️  No files found for processing"
-          echo "files_found=false" >> $GITHUB_OUTPUT
           exit 0
         fi
         
-        echo "files_found=true" >> $GITHUB_OUTPUT
-        echo "GROUP_ID=$group_id" >> $GITHUB_ENV
         echo "🆔 Group ID: $group_id"
         
-        # Save response for later use
-        echo "$init_response" > /tmp/init_response.json
-
-    - name: Ultra-Fast Parallel Upload
-      id: parallel_upload
-      if: steps.init.outputs.files_found == 'true'
-      run: |
-        echo "🚀 Starting ultra-fast parallel asset processing..."
-        
-        source /tmp/call_script.sh
-        
-        # Extract asset IDs from the init response
-        init_response=$(cat /tmp/init_response.json)
-        asset_ids=$(echo "$init_response" | grep -o '"assetId":"[^"]*"' | sed 's/"assetId":"//;s/"//')
-        
-        if [ -z "$asset_ids" ]; then
-          echo "❌ No asset IDs found"
-          exit 1
-        fi
-        
-        echo "📊 Assets to process:"
-        echo "$asset_ids" | while read -r asset_id; do
-          echo "  🎬 Asset ID: $asset_id"
-        done
-        
-        # Create upload function as separate file
-        cat > /tmp/upload_asset.sh << 'UPLOAD_EOF'
-        #!/bin/bash
-        source /tmp/call_script.sh
-        
-        upload_asset() {
-          local asset_id=$1
-          echo "🚀 [$asset_id] Starting ultra-fast upload"
+        # Step 2: Upload assets with proven settings
+        echo "📤 Step 2: Starting uploads..."
+        while true; do
+          upload_response=$(call_script "uploadAsset" "&groupId=$group_id&budget_ms=240000&window=4&pace_ms=500")
           
-          local attempts=0
-          local max_attempts=100
+          echo "Upload response: $upload_response"
           
-          while [ $attempts -lt $max_attempts ]; do
-            attempts=$((attempts + 1))
-            
-            # Ultra-aggressive settings
-            local response=$(call_script "uploadAsset" "&assetId=$asset_id&budget_ms=300000&window=16&pace_ms=25")
-            
-            if [ $? -ne 0 ]; then
-              echo "⚠️  [$asset_id] Call failed, retrying..."
-              sleep 2
-              continue
-            fi
-            
-            # Check for completion
-            if echo "$response" | grep -q '"paused":false'; then
-              echo "✅ [$asset_id] Upload completed!"
-              return 0
-            fi
-            
-            # Check for errors
-            if echo "$response" | grep -q '"ok":false'; then
-              local error=$(echo "$response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')
-              echo "❌ [$asset_id] Error: $error"
-              
-              if [[ "$error" == *"bandwidth"* ]]; then
-                echo "⏳ [$asset_id] Bandwidth throttled, backing off..."
-                sleep 10
-                continue
-              elif [[ "$error" == *"quota"* ]]; then
-                echo "⏳ [$asset_id] Quota hit, waiting..."
-                sleep 5
-                continue
-              else
-                return 1
-              fi
-            fi
-            
-            # Extract progress
-            local uploaded=$(echo "$response" | grep -o '"uploaded":[0-9]*' | sed 's/"uploaded"://')
-            local total=$(echo "$response" | grep -o '"totalChunks":[0-9]*' | sed 's/"totalChunks"://')
-            
-            if [ -n "$uploaded" ] && [ -n "$total" ] && [ "$total" -gt 0 ]; then
-              local percentage=$((uploaded * 100 / total))
-              echo "⚡ [$asset_id] Progress: $uploaded/$total chunks ($percentage%)"
-            fi
-            
-            sleep 1
-          done
-          
-          echo "❌ [$asset_id] Failed after $max_attempts attempts"
-          return 1
-        }
-        
-        upload_asset "$1"
-        UPLOAD_EOF
-        
-        chmod +x /tmp/upload_asset.sh
-        
-        # Launch parallel uploads
-        echo ""
-        echo "🚀 LAUNCHING PARALLEL UPLOADS..."
-        pids=()
-        
-        while read -r asset_id; do
-          if [ -n "$asset_id" ]; then
-            echo "🔥 Launching upload for asset: $asset_id"
-            /tmp/upload_asset.sh "$asset_id" &
-            pids+=($!)
-            sleep 0.2  # Brief stagger
-          fi
-        done <<< "$asset_ids"
-        
-        echo "📊 Launched ${#pids[@]} parallel processes"
-        
-        # Wait for all uploads
-        completed=0
-        failed=0
-        start_time=$(date +%s)
-        
-        for pid in "${pids[@]}"; do
-          if wait $pid; then
-            completed=$((completed + 1))
-            elapsed=$(($(date +%s) - start_time))
-            echo "✅ Upload completed! ($completed processed, ${elapsed}s elapsed)"
+          # Check if upload is complete
+          if echo "$upload_response" | grep -q '"paused":false'; then
+            echo "✅ Upload completed!"
+            break
+          elif echo "$upload_response" | grep -q '"ok":false'; then
+            echo "❌ Upload error: $(echo "$upload_response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')"
+            exit 1
           else
-            failed=$((failed + 1))
-            elapsed=$(($(date +%s) - start_time))
-            echo "❌ Upload failed! ($failed failed, ${elapsed}s elapsed)"
+            echo "⏳ Upload continuing..."
+            sleep 5
           fi
         done
         
-        total_time=$(($(date +%s) - start_time))
-        
-        echo ""
-        echo "🏆 UPLOAD RESULTS:"
-        echo "  ✅ Completed: $completed"
-        echo "  ❌ Failed: $failed"
-        echo "  ⏱️  Total time: ${total_time}s"
-        
-        if [ $failed -gt 0 ]; then
-          echo "❌ Some uploads failed"
-          exit 1
-        fi
-        
-        echo "🎉 ALL UPLOADS COMPLETED!"
-        echo "files_processed=$completed" >> $GITHUB_OUTPUT
-
-    - name: Finalize and Create Review Link
-      id: finalize
-      if: steps.init.outputs.files_found == 'true'
-      run: |
+        # Step 3: Finalize and get review link
         echo "🔗 Step 3: Creating Frame.io review link..."
+        finalize_response=$(call_script "finalizeFolder" "&groupId=$group_id")
         
-        source /tmp/call_script.sh
-        
-        finalize_response=$(call_script "finalizeFolder" "&groupId=$GROUP_ID")
-        
-        if [ $? -ne 0 ]; then
+        if echo "$finalize_response" | grep -q '"ok":false'; then
           echo "❌ Finalize error: $(echo "$finalize_response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')"
           exit 1
         fi
@@ -288,16 +130,13 @@ jobs:
         fi
         
         echo "🎬 Frame.io Review Link: $review_link"
-        echo "review_link=$review_link" >> $GITHUB_OUTPUT
+        echo "REVIEW_LINK=$review_link" >> $GITHUB_ENV
 
     - name: Update Airtable Record
-      if: steps.init.outputs.files_found == 'true'
       run: |
         echo "📝 Updating Airtable record..."
         
-        review_link="${{ steps.finalize.outputs.review_link }}"
-        
-        echo "✅ Updating with Frame.io link: $review_link"
+        echo "✅ Updating with Frame.io link: $REVIEW_LINK"
         
         curl -X PATCH \
           "https://api.airtable.com/v0/$AIRTABLE_BASE_ID/$TABLE_NAME" \
@@ -306,31 +145,24 @@ jobs:
           -d "{
             \"records\": [
               {
-                \"id\": \"$RECORD_ID\",
+                \"id\": \"${{ steps.params.outputs.record_id }}\",
                 \"fields\": {
-                  \"Low Quality Bit.ly Folder Link\": \"$review_link\"
+                  \"Low Quality Bit.ly Folder Link\": \"$REVIEW_LINK\"
                 }
               }
             ]
           }"
         
         echo ""
-        echo "✅ Airtable record updated successfully!"
+        echo "✅ Airtable record updated successfully with Frame.io link"
 
     - name: Success Summary
-      if: steps.init.outputs.files_found == 'true'
       run: |
         echo ""
         echo "🎉 ========== PROCESSING COMPLETE! =========="
-        echo "📁 Folder: $FOLDER_URL"
-        echo "🆔 Record: $RECORD_ID"
-        echo "📊 Files processed: ${{ steps.parallel_upload.outputs.files_processed }}"
-        echo "🎬 Frame.io link: ${{ steps.finalize.outputs.review_link }}"
+        echo "📁 Folder: ${{ steps.params.outputs.folder_url }}"
+        echo "🆔 Record: ${{ steps.params.outputs.record_id }}"
+        echo "🎬 Frame.io link: $REVIEW_LINK"
+        echo "⏱️  Processing method: STABLE (5-min approach)"
         echo "🚀 Status: SUCCESS"
-        echo "============================================"
-
-    - name: No Files Found
-      if: steps.init.outputs.files_found == 'false'
-      run: |
-        echo "ℹ️  No 'highlights' or 'teaser' files found in the folder"
-        echo "✅ Job completed successfully (no processing needed)"
+        echo "=============================================="
