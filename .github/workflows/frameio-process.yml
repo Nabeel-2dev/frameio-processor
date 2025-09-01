@@ -64,8 +64,9 @@ jobs:
           return 1
         }
         
-        local script_url="${{ steps.params.outputs.script_url }}"
-        local record_id="${{ steps.params.outputs.record_id }}"
+        # Set variables (removed 'local' keyword)
+        script_url="${{ steps.params.outputs.script_url }}"
+        record_id="${{ steps.params.outputs.record_id }}"
         
         # Step 1: Initialize folder
         echo "📁 Step 1: Initializing folder..."
