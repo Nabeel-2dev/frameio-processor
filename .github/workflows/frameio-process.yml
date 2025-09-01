@@ -9,6 +9,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     
+    env:
+      AIRTABLE_TOKEN: "patB9bR2XxXnsI2Q1.ff4bacd9dd4231bd1a1e1d5a14c7a46fa703aae4089a712cbc2cbce259a99713"
+      AIRTABLE_BASE_ID: "app6tQcsOfgwuSEUs"
+      TABLE_NAME: "Result%20Folders"
+    
     steps:
       - name: Process Frame.io Folder
         id: process
@@ -41,6 +46,7 @@ jobs:
                 echo "$response"
               else
                 echo "❌ Could not extract redirect URL"
+                echo "$body"
                 return 1
               fi
             else
@@ -51,90 +57,99 @@ jobs:
           # Step 1: Initialize folder
           echo "📁 Step 1: Initializing folder..."
           folder_url="${{ github.event.client_payload.folderUrl }}"
-          encoded_url=$(echo "$folder_url" | sed 's/&/%26/g;s/=/%3D/g;s/?/%3F/g')
+          # URL encode the folder URL
+          encoded_url=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$folder_url', safe=''))")
           
           init_response=$(call_script "initFolder" "&folderUrl=$encoded_url")
           echo "Init response: $init_response"
           
+          # Check if response contains error
+          if echo "$init_response" | grep -q '"ok":false'; then
+            error_msg=$(echo "$init_response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')
+            echo "❌ Init error: $error_msg"
+            echo "result=error" >> $GITHUB_OUTPUT
+            echo "error=Initialization failed: $error_msg" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
           # Check if no files found
-          if echo "$init_response" | jq -e '.files | length == 0' > /dev/null 2>&1; then
+          if echo "$init_response" | grep -q '"files":\[\]'; then
             echo "ℹ️ No recent highlights/teaser files found"
             echo "result=no_files" >> $GITHUB_OUTPUT
             echo "message=No recent highlights or teaser files found" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          # Extract group ID and files
-          group_id=$(echo "$init_response" | jq -r '.groupId')
-          files_count=$(echo "$init_response" | jq -r '.files | length')
+          # Extract group ID and files info
+          group_id=$(echo "$init_response" | grep -o '"groupId":"[^"]*"' | sed 's/"groupId":"//;s/"//')
           
-          echo "✅ Found $files_count file(s) to process"
-          echo "$init_response" | jq -r '.files[] | "  - \(.fileName) (\(.totalChunks) chunks, \(.fileSize/1024/1024 | floor) MB)"'
+          echo "✅ Files found for processing"
           echo "🆔 Group ID: $group_id"
+          
+          # Extract asset IDs for upload
+          asset_ids=$(echo "$init_response" | grep -o '"assetId":"[^"]*"' | sed 's/"assetId":"//;s/"//')
           
           # Step 2: Upload each file
           echo ""
           echo "📤 Step 2: Starting uploads..."
           
-          file_assets=$(echo "$init_response" | jq -r '.files[].assetId')
           file_count=0
-          total_files=$(echo "$file_assets" | wc -l)
+          total_files=$(echo "$asset_ids" | wc -l)
           
-          for asset_id in $file_assets; do
+          for asset_id in $asset_ids; do
             file_count=$((file_count + 1))
-            file_name=$(echo "$init_response" | jq -r ".files[] | select(.assetId == \"$asset_id\") | .fileName")
-            total_chunks=$(echo "$init_response" | jq -r ".files[] | select(.assetId == \"$asset_id\") | .totalChunks")
             
             echo ""
-            echo "📂 [$file_count/$total_files] Processing: $file_name"
-            echo "📊 Total chunks: $total_chunks"
+            echo "📂 [$file_count/$total_files] Processing asset: $asset_id"
             
             completed=false
             attempts=0
-            max_attempts=50
+            max_attempts=30
             
             while [ "$completed" = false ] && [ $attempts -lt $max_attempts ]; do
               attempts=$((attempts + 1))
               echo "  🔄 Attempt $attempts/$max_attempts"
               
-              # Call uploadAsset with 4.5 minute budget (since GitHub has 15 min total)
-              upload_response=$(call_script "uploadAsset" "&assetId=$asset_id&budget_ms=270000&window=2&pace_ms=200")
+              # Call uploadAsset with 4 minute budget
+              upload_response=$(call_script "uploadAsset" "&assetId=$asset_id&budget_ms=240000&window=2&pace_ms=200")
               
-              if echo "$upload_response" | jq -e '.ok == false' > /dev/null 2>&1; then
-                error_msg=$(echo "$upload_response" | jq -r '.error // "Unknown error"')
+              # Check for errors
+              if echo "$upload_response" | grep -q '"ok":false'; then
+                error_msg=$(echo "$upload_response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')
                 echo "  ❌ Error: $error_msg"
                 
                 # Handle specific errors
-                if [[ "$error_msg" == *"timeout"* ]] || [[ "$error_msg" == *"bandwidth"* ]]; then
-                  echo "  ⏳ Recoverable error, retrying..."
-                  sleep 2
+                if [[ "$error_msg" == *"timeout"* ]] || [[ "$error_msg" == *"bandwidth"* ]] || [[ "$error_msg" == *"quota"* ]]; then
+                  echo "  ⏳ Recoverable error, retrying in 3 seconds..."
+                  sleep 3
                   continue
                 fi
                 
                 if [ $attempts -lt 5 ]; then
                   echo "  🔄 Early attempt, retrying..."
-                  sleep 1
+                  sleep 2
                   continue
                 fi
                 
                 echo "❌ Upload failed after $attempts attempts: $error_msg"
                 echo "result=error" >> $GITHUB_OUTPUT
-                echo "error=Upload failed for $file_name: $error_msg" >> $GITHUB_OUTPUT
+                echo "error=Upload failed for asset $asset_id: $error_msg" >> $GITHUB_OUTPUT
                 exit 1
               fi
               
-              uploaded=$(echo "$upload_response" | jq -r '.uploaded // 0')
-              total=$(echo "$upload_response" | jq -r '.totalChunks // 0')
-              paused=$(echo "$upload_response" | jq -r '.paused // false')
+              # Extract upload progress
+              uploaded=$(echo "$upload_response" | grep -o '"uploaded":[0-9]*' | sed 's/"uploaded"://')
+              total=$(echo "$upload_response" | grep -o '"totalChunks":[0-9]*' | sed 's/"totalChunks"://')
+              paused=$(echo "$upload_response" | grep -o '"paused":[^,}]*' | sed 's/"paused"://')
               
               echo "  📈 Progress: $uploaded/$total chunks"
               
-              if [ "$uploaded" = "$total" ]; then
-                echo "  ✅ $file_name: Upload completed!"
+              if [ "$uploaded" = "$total" ] && [ "$uploaded" != "" ] && [ "$uploaded" != "0" ]; then
+                echo "  ✅ Asset $asset_id: Upload completed!"
                 completed=true
               elif [ "$paused" = "true" ]; then
                 echo "  ⏸️ Upload paused, resuming..."
-                sleep 1
+                sleep 2
               else
                 echo "  ⏩ Continuing upload..."
                 sleep 1
@@ -142,9 +157,9 @@ jobs:
             done
             
             if [ "$completed" = false ]; then
-              echo "❌ Failed to upload $file_name after $max_attempts attempts"
+              echo "❌ Failed to upload asset $asset_id after $max_attempts attempts"
               echo "result=error" >> $GITHUB_OUTPUT
-              echo "error=Upload failed for $file_name after $max_attempts attempts" >> $GITHUB_OUTPUT
+              echo "error=Upload failed for asset $asset_id after $max_attempts attempts" >> $GITHUB_OUTPUT
               exit 1
             fi
           done
@@ -155,16 +170,16 @@ jobs:
           
           final_response=$(call_script "finalizeFolder" "&groupId=$group_id")
           
-          if echo "$final_response" | jq -e '.ok == false' > /dev/null 2>&1; then
-            error_msg=$(echo "$final_response" | jq -r '.error // "Unknown error"')
+          if echo "$final_response" | grep -q '"ok":false'; then
+            error_msg=$(echo "$final_response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')
             echo "❌ Finalization failed: $error_msg"
             echo "result=error" >> $GITHUB_OUTPUT
             echo "error=Finalization failed: $error_msg" >> $GITHUB_OUTPUT
             exit 1
           fi
           
-          review_link=$(echo "$final_response" | jq -r '.reviewLink')
-          review_id=$(echo "$final_response" | jq -r '.reviewLinkId')
+          review_link=$(echo "$final_response" | grep -o '"reviewLink":"[^"]*"' | sed 's/"reviewLink":"//;s/"//')
+          review_id=$(echo "$final_response" | grep -o '"reviewLinkId":"[^"]*"' | sed 's/"reviewLinkId":"//;s/"//')
           
           echo "🎉 Frame.io review link created: $review_link"
           echo "🆔 Review Link ID: $review_id"
@@ -173,7 +188,7 @@ jobs:
           echo "result=success" >> $GITHUB_OUTPUT
           echo "review_link=$review_link" >> $GITHUB_OUTPUT
           echo "review_id=$review_id" >> $GITHUB_OUTPUT
-          echo "files_processed=$files_count" >> $GITHUB_OUTPUT
+          echo "files_processed=$total_files" >> $GITHUB_OUTPUT
 
       - name: Update Airtable Record
         if: always()
@@ -185,8 +200,8 @@ jobs:
             echo "✅ Updating with Frame.io link: ${{ steps.process.outputs.review_link }}"
             
             curl -X PATCH \
-              "https://api.airtable.com/v0/${{ secrets.AIRTABLE_BASE_ID }}/Result%20Folders/${{ github.event.client_payload.recordId }}" \
-              -H "Authorization: Bearer ${{ secrets.AIRTABLE_TOKEN }}" \
+              "https://api.airtable.com/v0/$AIRTABLE_BASE_ID/$TABLE_NAME/${{ github.event.client_payload.recordId }}" \
+              -H "Authorization: Bearer $AIRTABLE_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{\"fields\": {\"Low Quality Bit.ly Folder Link\": \"${{ steps.process.outputs.review_link }}\"}}"
             
@@ -197,8 +212,8 @@ jobs:
             echo "ℹ️ Updating with no files message"
             
             curl -X PATCH \
-              "https://api.airtable.com/v0/${{ secrets.AIRTABLE_BASE_ID }}/Result%20Folders/${{ github.event.client_payload.recordId }}" \
-              -H "Authorization: Bearer ${{ secrets.AIRTABLE_TOKEN }}" \
+              "https://api.airtable.com/v0/$AIRTABLE_BASE_ID/$TABLE_NAME/${{ github.event.client_payload.recordId }}" \
+              -H "Authorization: Bearer $AIRTABLE_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{\"fields\": {\"Low Quality Bit.ly Folder Link\": \"No recent highlights/teaser files found\"}}"
             
@@ -210,8 +225,8 @@ jobs:
             echo "❌ Updating with error: $error_msg"
             
             curl -X PATCH \
-              "https://api.airtable.com/v0/${{ secrets.AIRTABLE_BASE_ID }}/Result%20Folders/${{ github.event.client_payload.recordId }}" \
-              -H "Authorization: Bearer ${{ secrets.AIRTABLE_TOKEN }}" \
+              "https://api.airtable.com/v0/$AIRTABLE_BASE_ID/$TABLE_NAME/${{ github.event.client_payload.recordId }}" \
+              -H "Authorization: Bearer $AIRTABLE_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{\"fields\": {\"Low Quality Bit.ly Folder Link\": \"Error: $error_msg\"}}"
             
