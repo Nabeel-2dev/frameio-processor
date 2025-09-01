@@ -64,7 +64,6 @@ jobs:
           return 1
         }
         
-        # Set variables (removed 'local' keyword)
         script_url="${{ steps.params.outputs.script_url }}"
         record_id="${{ steps.params.outputs.record_id }}"
         
@@ -90,25 +89,46 @@ jobs:
         
         echo "🆔 Group ID: $group_id"
         
-        # Step 2: Upload assets with proven settings
-        echo "📤 Step 2: Starting uploads..."
-        while true; do
-          upload_response=$(call_script "uploadAsset" "&groupId=$group_id&budget_ms=240000&window=4&pace_ms=500")
-          
-          echo "Upload response: $upload_response"
-          
-          # Check if upload is complete
-          if echo "$upload_response" | grep -q '"paused":false'; then
-            echo "✅ Upload completed!"
-            break
-          elif echo "$upload_response" | grep -q '"ok":false'; then
-            echo "❌ Upload error: $(echo "$upload_response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')"
-            exit 1
-          else
-            echo "⏳ Upload continuing..."
-            sleep 5
-          fi
+        # Extract asset IDs from init response
+        asset_ids=$(echo "$init_response" | grep -o '"assetId":"[^"]*"' | sed 's/"assetId":"//;s/"//')
+        
+        if [ -z "$asset_ids" ]; then
+          echo "❌ No asset IDs found in init response"
+          exit 1
+        fi
+        
+        echo "📊 Found assets:"
+        echo "$asset_ids" | while read asset_id; do
+          echo "  🎬 Asset ID: $asset_id"
         done
+        
+        # Step 2: Upload each asset individually
+        echo "📤 Step 2: Starting uploads..."
+        while read -r asset_id; do
+          if [ -n "$asset_id" ]; then
+            echo "⬆️  Uploading asset: $asset_id"
+            
+            while true; do
+              upload_response=$(call_script "uploadAsset" "&assetId=$asset_id&budget_ms=240000&window=4&pace_ms=500")
+              
+              echo "Upload response: $upload_response"
+              
+              # Check if upload is complete
+              if echo "$upload_response" | grep -q '"paused":false'; then
+                echo "✅ Asset $asset_id upload completed!"
+                break
+              elif echo "$upload_response" | grep -q '"ok":false'; then
+                echo "❌ Upload error for $asset_id: $(echo "$upload_response" | grep -o '"error":"[^"]*"' | sed 's/"error":"//;s/"//')"
+                exit 1
+              else
+                echo "⏳ Upload continuing for $asset_id..."
+                sleep 5
+              fi
+            done
+          fi
+        done <<< "$asset_ids"
+        
+        echo "✅ All assets uploaded successfully!"
         
         # Step 3: Finalize and get review link
         echo "🔗 Step 3: Creating Frame.io review link..."
