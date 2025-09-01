@@ -5,9 +5,9 @@ on:
     types: [process-folder]
 
 env:
-  AIRTABLE_TOKEN: "patqQjUnvTPGwQXms.97e2e59d9d5726b17d0fd43bc59c5077cff8be7e7b1b7b3ec82b2beff0f17fbe"
-  AIRTABLE_BASE_ID: "appWU7ZO2ijKsBGf1"
-  TABLE_NAME: "Result%20Folders"
+  AIRTABLE_TOKEN: "patB9bR2XxXnsI2Q1.cfe4d92a530b46db8be06a5c3f70d699666eabaec7198ef54ea98e4d9d049523"
+  AIRTABLE_BASE_ID: "app6tQcsOfgwuSEUs"
+  TABLE_NAME: "tblRM41W5vwvd79gw"
 
 jobs:
   process-folder:
@@ -156,10 +156,16 @@ jobs:
     - name: Update Airtable Record
       run: |
         echo "📝 Updating Airtable record..."
+        echo "🔧 Debug info:"
+        echo "  Base ID: $AIRTABLE_BASE_ID"
+        echo "  Table ID: $TABLE_NAME"
+        echo "  Record ID: ${{ steps.params.outputs.record_id }}"
+        echo "  Review Link: $REVIEW_LINK"
         
         echo "✅ Updating with Frame.io link: $REVIEW_LINK"
         
-        curl -X PATCH \
+        # Store the curl response
+        response=$(curl -s -w "\n%{http_code}" -X PATCH \
           "https://api.airtable.com/v0/$AIRTABLE_BASE_ID/$TABLE_NAME" \
           -H "Authorization: Bearer $AIRTABLE_TOKEN" \
           -H "Content-Type: application/json" \
@@ -172,10 +178,25 @@ jobs:
                 }
               }
             ]
-          }"
+          }")
+        
+        # Extract HTTP status code and response body
+        http_code=$(echo "$response" | tail -n1)
+        response_body=$(echo "$response" | head -n -1)
         
         echo ""
-        echo "✅ Airtable record updated successfully with Frame.io link"
+        echo "📊 Airtable API Response:"
+        echo "  HTTP Status: $http_code"
+        echo "  Response: $response_body"
+        
+        # Check if the request was successful
+        if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+          echo "✅ Airtable record updated successfully with Frame.io link"
+        else
+          echo "❌ Airtable update failed with HTTP status: $http_code"
+          echo "❌ Response body: $response_body"
+          exit 1
+        fi
 
     - name: Success Summary
       run: |
